@@ -13,6 +13,12 @@ namespace xx {
 
 uint32_t crc32(uint32_t crc, const void* p, size_t n);
 
+// Decompresses one raw Deflate stream on `threads` worker threads (pinflate.cpp); sink gets
+// the output in order. On failure err is set; err == "retry" means the stream has a block too
+// large for this decoder's memory guard and should be decompressed with Inflater::stream instead.
+bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned threads, size_t chunk_bytes,
+                      const std::function<bool(const uint8_t*, size_t)>& sink, std::string& err);
+
 // One per worker thread; reuses its state across entries.
 class Inflater {
 public:

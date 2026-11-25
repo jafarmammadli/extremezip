@@ -14,6 +14,8 @@ struct Options {
     unsigned closers = 0;                   // handle-closing threads, 0 = auto
     uint64_t one_shot_limit = 64ull << 20;  // entries up to this size are inflated in one call (libdeflate)
     uint64_t prealloc_min = 1ull << 20;     // set final file size up front for files at least this big
+    uint64_t pinflate_min = 128ull << 20;   // Deflate entries this big are decompressed on several threads
+    size_t pinflate_chunk = 4 << 20;        // compressed bytes per parallel-decompression chunk
     bool stop_on_error = false;
 };
 

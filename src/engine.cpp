@@ -139,6 +139,7 @@ struct Job {
     const Options& opt;
     Progress& p;
     Closer& closer;
+    unsigned helpers;  // threads available per worker for parallel decompression of one entry
 };
 
 class Worker {
@@ -205,9 +206,21 @@ private:
             if (crc == e.crc && !write_all(h, buf_.get(), e.size, err)) return false;
             if (crc == e.crc) j_.p.bytes_done.fetch_add(e.size, std::memory_order_relaxed);
         } else {
-            auto sink = [&](const uint8_t* d, size_t n) { return emit(h, d, n, crc, err); };
+            uint64_t emitted = 0;
+            auto sink = [&](const uint8_t* d, size_t n) { emitted += n; return emit(h, d, n, crc, err); };
+            if (j_.helpers >= 2 && e.size >= j_.opt.pinflate_min) {
+                if (parallel_inflate(src, e.comp_size, e.size, j_.helpers, j_.opt.pinflate_chunk, sink, err)) goto check;
+                if (err != "retry") return false;
+                // Stream has a block too big for the parallel decoder: start over sequentially.
+                LARGE_INTEGER zero{};
+                if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) { err = win_error(); return false; }
+                j_.p.bytes_done.fetch_sub(emitted, std::memory_order_relaxed);
+                crc = 0, emitted = 0;
+                err.clear();
+            }
             if (!inf_.stream(src, e.comp_size, e.size, sink, err)) return false;
         }
+    check:
         if (crc != e.crc) { err = "CRC mismatch (corrupt data)"; return false; }
         return true;
     }
@@ -280,7 +293,8 @@ size_t extract(const std::wstring& archive, const std::wstring& dest, const Opti
 
     {
         Closer closer(opt.closers ? opt.closers : n);
-        Job job{mf, root, opt, p, closer};
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        Job job{mf, root, opt, p, closer, std::max(1u, (opt.threads ? opt.threads : hw) / n)};
         std::atomic<size_t> next{0};
         auto run = [&] {
             no_power_throttling();

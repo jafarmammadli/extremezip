@@ -47,6 +47,12 @@ foreach ($z in 'deflate', 'stored') {
 }
 Check ((Get-Item "$Work\out-deflate-\a\t1.txt").IsReadOnly) "read-only attribute kept"
 
+# Parallel decompression of one big Deflate stream: many tiny chunks, several encoders/levels.
+foreach ($lvl in 'mx1', 'mx9') {
+    & $7z a -tzip -mm=Deflate "-$lvl" "$Work\single-$lvl.zip" "$Work\src\a\b\c\big.bin" | Out-Null
+    & $xx "$Work\single-$lvl.zip" -o "$Work\out-single-$lvl" -q -t 8 --one-shot-mb 0 --pinflate-min-mb 0 --pinflate-chunk-kb 64
+    Check ($LASTEXITCODE -eq 0 -and (Get-FileHash "$Work\out-single-$lvl\big.bin").Hash -eq (Get-FileHash "$Work\src\a\b\c\big.bin").Hash) "parallel inflate $lvl"
+}
 # Corrupt data byte inside the big entry: CRC or deflate error, partial file removed.
 $bytes = [IO.File]::ReadAllBytes("$Work\deflate.zip")
 $bad = $bytes.Clone(); $bad[[int]($bad.Length / 2)] = $bad[[int]($bad.Length / 2)] -bxor 0xFF

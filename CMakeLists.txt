@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 project(ExtremeExtract C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -29,7 +29,7 @@ FetchContent_Declare(zlibng
 
 FetchContent_MakeAvailable(libdeflate zlibng)
 
-add_library(xxengine STATIC src/zip.cpp src/inflate.cpp src/engine.cpp)
+add_library(xxengine STATIC src/zip.cpp src/inflate.cpp src/pinflate.cpp src/engine.cpp)
 target_include_directories(xxengine PUBLIC src)
 target_link_libraries(xxengine PUBLIC libdeflate::libdeflate_static zlib)
 target_compile_definitions(xxengine PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
