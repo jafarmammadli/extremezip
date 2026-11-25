@@ -11,7 +11,8 @@ param(
     [string[]]$Tools = @('xx', '7z', 'winrar', 'tar', 'expand-archive'),
     [string]$Dest = "$env:TEMP\xx-bench",
     [string]$FzipCmd,
-    [string]$XxArgs = ''
+    [string]$XxArgs = '',
+    [int]$Cooldown = 45   # seconds of idle after each run so the SSD's SLC write cache recovers
 )
 $ErrorActionPreference = 'Continue'
 $Tools = $Tools -split ','; if ($Archives) { $Archives = $Archives -split ',' }  # -File passes "a,b" as one string
@@ -53,6 +54,7 @@ function Wait-DiskIdle {
         $w = (Get-Counter '\PhysicalDisk(_Total)\Disk Write Bytes/sec' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue
         if ($w -lt 20MB) { $quiet++ } else { $quiet = 0 }
     }
+    Start-Sleep $Cooldown
 }
 
 function Measure-Run($cmdline) {
@@ -84,7 +86,7 @@ foreach ($z in $zips) {
             $verify = ''
             if ($r -eq 1) {  # integrity check once per tool/archive, against 7-Zip's output
                 $man = Manifest $d
-                if ($t -eq '7z') { $reference[$z.Name] = $man }
+                if ($t -eq '7z') { $reference[$z.BaseName] = $man }
                 $verify = $man
             }
             $bytes = [long](($verify -split ' ')[1])
