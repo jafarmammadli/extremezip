@@ -23,7 +23,8 @@ jobs:
           cmake --build build
       - name: Test
         shell: powershell
-        run: powershell -NoProfile -File tests\test.ps1; exit $LASTEXITCODE
+        # RUNNER_TEMP, not TEMP: TEMP is an 8.3 short path on the runner and breaks Tree's prefix strip
+        run: powershell -NoProfile -File tests\test.ps1 -Work "$env:RUNNER_TEMP\xx-test"; exit $LASTEXITCODE
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: powershell
