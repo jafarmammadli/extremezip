@@ -14,6 +14,7 @@ param(
     [string]$XxArgs = ''
 )
 $ErrorActionPreference = 'Continue'
+$Tools = $Tools -split ','; if ($Archives) { $Archives = $Archives -split ',' }  # -File passes "a,b" as one string
 $here = $PSScriptRoot
 $out = "$here\out"; New-Item -ItemType Directory -Force $out | Out-Null
 $xx = (Resolve-Path "$here\..\build\xx.exe").Path
@@ -44,6 +45,16 @@ print(f'{n} {b} {h.hexdigest()[:16]}')
 "@ $dir
 }
 
+# Writes are cached by Windows and flushed later; without this, each tool would pay for the
+# previous tool's background flush. Waits until disk writes drop below 20 MB/s for 2 s (max 3 min).
+function Wait-DiskIdle {
+    $quiet = 0
+    for ($i = 0; $i -lt 180 -and $quiet -lt 2; $i++) {
+        $w = (Get-Counter '\PhysicalDisk(_Total)\Disk Write Bytes/sec' -SampleInterval 1 -MaxSamples 1).CounterSamples[0].CookedValue
+        if ($w -lt 20MB) { $quiet++ } else { $quiet = 0 }
+    }
+}
+
 function Measure-Run($cmdline) {
     $exe, $argline = if ($cmdline.StartsWith('"')) { $i = $cmdline.IndexOf('"', 1); $cmdline.Substring(1, $i - 1), $cmdline.Substring($i + 1) }
                      else { $i = $cmdline.IndexOf(' '); $cmdline.Substring(0, $i), $cmdline.Substring($i + 1) }
@@ -68,7 +79,8 @@ foreach ($z in $zips) {
             $d = "$Dest\$t"
             if (Test-Path $d) { cmd /c rd /s /q "`"$d`"" }
             New-Item -ItemType Directory -Force $d | Out-Null
-            $m = Measure-Run ($cmds[$t].Replace('{archive}', $z.FullName).Replace('{dest}', $d))
+            Wait-DiskIdle
+            $m =Measure-Run ($cmds[$t].Replace('{archive}', $z.FullName).Replace('{dest}', $d))
             $verify = ''
             if ($r -eq 1) {  # integrity check once per tool/archive, against 7-Zip's output
                 $man = Manifest $d

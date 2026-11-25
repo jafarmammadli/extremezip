@@ -1,3 +1,4 @@
 build/
 bench/data/
 bench/out/
+bench/*.log
