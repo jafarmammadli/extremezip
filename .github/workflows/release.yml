@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Test
+        shell: powershell
+        run: powershell -NoProfile -File tests\test.ps1; exit $LASTEXITCODE
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        run: |
+          $d = "pkg"
+          New-Item -ItemType Directory $d, "$d\third-party" | Out-Null
+          Copy-Item build\xx.exe, build\ExtremeExtract.exe, LICENSE, README.md $d
+          Copy-Item build\_deps\libdeflate-src\COPYING "$d\third-party\libdeflate-LICENSE.txt"
+          Copy-Item build\_deps\zlibng-src\LICENSE.md "$d\third-party\zlib-ng-LICENSE.md"
+          Compress-Archive "$d\*" "ExtremeExtract-${{ github.ref_name }}-win64.zip"
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: ExtremeExtract-*-win64.zip
+          generate_release_notes: true

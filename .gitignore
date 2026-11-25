@@ -3,3 +3,4 @@ bench/data/
 bench/out/
 bench/*.log
 build-dev/
+graphify-out/
