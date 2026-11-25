@@ -20,8 +20,7 @@ static int usage() {
     return 2;
 }
 
-int wmain(int argc, wchar_t** argv) {
-    SetConsoleOutputCP(CP_UTF8);
+static int run(int argc, wchar_t** argv) {
     std::wstring archive, dest;
     xx::Options opt;
     bool quiet = false;
@@ -63,4 +62,18 @@ int wmain(int argc, wchar_t** argv) {
                     (unsigned long long)p.files_done.load(), mb, s, mb / s, p.threads.load(), errors);
     }
     return errors ? 1 : 0;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    int rc = run(argc, argv);
+    // Started from Explorer (double-click or drag-drop): the console is ours alone and
+    // would vanish on exit, so keep it open. Shells and scripts share theirs and skip this.
+    DWORD pids[2];
+    if (GetConsoleProcessList(pids, 2) == 1) {
+        if (argc < 2) std::fputs("\nxx is a command-line tool: run it from a terminal, drag a .zip onto it,\nor use ExtremeExtract.exe for the window version.\n", stderr);
+        std::fputs("\nPress Enter to close.", stderr);
+        std::getchar();
+    }
+    return rc;
 }
