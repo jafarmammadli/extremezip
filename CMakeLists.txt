@@ -37,3 +37,6 @@ target_compile_options(xxengine PUBLIC /W4 /permissive- /utf-8 $<$<CONFIG:Releas
 
 add_executable(xx src/cli.cpp)
 target_link_libraries(xx PRIVATE xxengine)
+
+add_executable(ExtremeExtract WIN32 src/gui.cpp src/gui.manifest)
+target_link_libraries(ExtremeExtract PRIVATE xxengine)
