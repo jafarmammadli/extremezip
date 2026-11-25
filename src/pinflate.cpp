@@ -122,7 +122,9 @@ const Huff& fixed_dist() {
 
 struct Chunk {
     std::unique_ptr<uint16_t[]> out;
-    size_t size = 0, cap = 0;
+    std::unique_ptr<uint8_t[]> bytes;  // out narrowed to bytes; markers left for the consumer
+    size_t size = 0, cap = 0, bytes_cap = 0;
+    size_t marker_end = 0;              // no markers at or after this index
     uint64_t start = 0, end = 0;
     bool ok = false, final = false, too_big = false;
 
@@ -183,9 +185,15 @@ bool decode(const uint8_t* in, uint64_t in_n, uint64_t start, uint64_t stop_bit,
                 if (!lens[256] || !lit.build(lens, hlit, Code::dynamic) || !dist.build(lens + hlit, hdist, Code::dynamic)) return false;
                 pl = &lit, pd = &dist;
             }
+            constexpr uint64_t M = (1 << TB) - 1;
             for (;;) {
-                c.reserve(c.size + 258);
-                const int s = pl->decode(b);
+                if (c.size + 258 + 8 > c.cap) c.reserve(c.size + 258 + 8);  // +8: copy overshoot
+                // One 57-bit peek covers a table-hit literal/length code (10) + length extra (5)
+                // + distance code (10) + distance extra (13).
+                uint64_t v = b.peek();
+                int s;
+                if (const uint16_t e = pl->tab[v & M]) s = e >> 4, v >>= e & 15, b.pos += e & 15;
+                else s = pl->decode(b), v = b.peek();
                 if (s < 256) {
                     if (s < 0) return false;
                     c.out[c.size++] = (uint16_t)s;
@@ -193,16 +201,22 @@ bool decode(const uint8_t* in, uint64_t in_n, uint64_t start, uint64_t stop_bit,
                 }
                 if (s == 256) break;
                 if (s > 285) return false;
-                const uint32_t len = LBASE[s - 257] + b.get(LEXT[s - 257]);
-                const int ds = pd->decode(b);
+                const int le = LEXT[s - 257];
+                const uint32_t len = LBASE[s - 257] + (uint32_t)(v & ((1u << le) - 1));
+                v >>= le, b.pos += le;
+                int ds;
+                if (const uint16_t e = pd->tab[v & M]) ds = e >> 4, v >>= e & 15, b.pos += e & 15;
+                else ds = pd->decode(b), v = b.peek();
                 if (ds < 0 || ds > 29) return false;
-                const uint32_t d = DBASE[ds] + b.get(DEXT[ds]);
+                const uint32_t d = DBASE[ds] + (uint32_t)(v & ((1u << DEXT[ds]) - 1));
+                b.pos += DEXT[ds];
                 if (b.over()) return false;
                 if (c.size + len > kHardLimit) { c.too_big = true; return false; }
                 uint16_t* dst = c.out.get() + c.size;
                 if (d <= c.size) {
                     const uint16_t* src = dst - d;
-                    if (d >= len) std::memcpy(dst, src, len * 2);
+                    if (d >= 8)  // 8 symbols per step; may write up to 7 past len (reserved above)
+                        for (uint32_t k = 0; k < len; k += 8) std::memcpy(dst + k, src + k, 16);
                     else for (uint32_t k = 0; k < len; ++k) dst[k] = src[k];
                 } else {  // reaches into the unknown window before the chunk: emit markers
                     for (uint32_t k = 0; k < len; ++k) {
@@ -218,6 +232,19 @@ bool decode(const uint8_t* in, uint64_t in_n, uint64_t start, uint64_t stop_bit,
     }
     c.end = b.pos;
     return true;
+}
+
+// Narrows symbols to bytes on the decoding thread, so the in-order consumer only has to patch
+// the (usually short) prefix that still references the previous chunk's window.
+void narrow(Chunk& c) {
+    if (c.bytes_cap < c.size) c.bytes = std::make_unique_for_overwrite<uint8_t[]>(c.bytes_cap = c.size);
+    const uint16_t* s = c.out.get();
+    uint8_t* o = c.bytes.get();
+    size_t last = 0;
+    for (size_t i = 0; i < c.size; ++i) o[i] = (uint8_t)s[i];
+    for (size_t i = c.size; i-- > 0;)
+        if (s[i] > 255) { last = i + 1; break; }
+    c.marker_end = last;
 }
 
 // Cheap header pre-check before a trial decode at bit p.
@@ -250,13 +277,17 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
     bool abort = false;
     std::atomic<size_t> next{0};
 
-    auto speculate = [&](size_t i, Chunk& c) {
+    // Chunk buffers are recycled: fresh multi-MB allocations page-fault, and page faults from many
+    // threads serialize in the kernel's memory manager.
+    std::vector<std::unique_ptr<Chunk>> spare;
+
+    auto speculate = [&](size_t i, Chunk& c, Chunk& probe) {
         const uint64_t lo = nominal(i), hi = std::min(nominal(i + 1), in_n * 8);
         const uint64_t stop = i + 1 < nchunks ? nominal(i + 1) : UINT64_MAX;
-        Chunk probe;
+        c.ok = false;
         for (uint64_t p = lo; p < hi; ++p) {
             if (i && (!plausible(Bits{in, in_n, p}) || !decode(in, in_n, p, UINT64_MAX, SIZE_MAX, 2, probe))) continue;
-            c.ok = decode(in, in_n, p, stop, soft_cap, 0, c);
+            if ((c.ok = decode(in, in_n, p, stop, soft_cap, 0, c))) narrow(c);
             return;
         }
     };
@@ -264,14 +295,17 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
     std::vector<std::jthread> pool;
     for (unsigned t = 0; t < threads; ++t)
         pool.emplace_back([&] {
+            Chunk probe;
             for (size_t i; (i = next.fetch_add(1)) < nchunks;) {
+                std::unique_ptr<Chunk> c;
                 {
                     std::unique_lock l(m);
                     cv.wait(l, [&] { return abort || i < consumed + inflight; });
                     if (abort) return;
+                    if (!spare.empty()) c = std::move(spare.back()), spare.pop_back();
                 }
-                auto c = std::make_unique<Chunk>();
-                try { speculate(i, *c); } catch (...) { c->ok = false; }
+                if (!c) c = std::make_unique<Chunk>();
+                try { speculate(i, *c, probe); } catch (...) { c->ok = false; }
                 { std::lock_guard l(m); res[i] = std::move(c); }
                 cv.notify_all();
             }
@@ -287,13 +321,12 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
         return *res[j];
     };
     auto release = [&](size_t j) {
-        { std::lock_guard l(m); res[j].reset(); consumed = j + 1; }
+        { std::lock_guard l(m); spare.push_back(std::move(res[j])); consumed = j + 1; }
         cv.notify_all();
     };
 
     uint8_t window[kWin];
-    size_t wlen = 0, bytes_cap = 0;
-    std::unique_ptr<uint8_t[]> bytes;
+    size_t wlen = 0;
     uint64_t pos = 0, produced = 0;
     bool final = false;
     size_t j = 0;
@@ -315,6 +348,7 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
                 err = serial.too_big ? "retry" : "corrupt deflate data";
                 return false;
             }
+            narrow(serial);
             use = &serial;
             ++n_serial;
         }
@@ -322,14 +356,12 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
         // Resolve window markers into bytes, slide the window, hand the bytes to the caller.
         const size_t n = use->size;
         if (produced + n > out_n) { err = "uncompressed data longer than declared size"; return false; }
-        if (bytes_cap < n) bytes = std::make_unique_for_overwrite<uint8_t[]>(bytes_cap = n);
         const uint16_t* s = use->out.get();
-        uint8_t* o = bytes.get();
+        uint8_t* o = use->bytes.get();
         const size_t min_idx = kWin - wlen;
-        for (size_t i = 0; i < n; ++i) {
-            const uint16_t v = s[i];
-            if (v < 256) { o[i] = (uint8_t)v; continue; }
-            const size_t idx = v - 256u;
+        for (size_t i = 0; i < use->marker_end; ++i) {
+            if (s[i] < 256) continue;
+            const size_t idx = s[i] - 256u;
             if (idx < min_idx) { err = "corrupt deflate data (distance too far back)"; return false; }
             o[i] = window[idx];
         }
@@ -339,8 +371,8 @@ bool parallel_inflate(const uint8_t* in, uint64_t in_n, uint64_t out_n, unsigned
         produced += n;
         pos = use->end;
         final = use->final;
-        if (use != &serial) release(j++);
         if (n && !sink(o, n)) { if (err.empty()) err = "cancelled"; return false; }
+        if (use != &serial) release(j++);
         if (!final && pos >= in_n * 8) { err = "truncated deflate data"; return false; }
     }
 #pragma warning(suppress : 4996)  // read-only getenv is fine

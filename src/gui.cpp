@@ -22,12 +22,17 @@
 
 namespace {
 
-enum { ID_ARCHIVE = 100, ID_OPEN, ID_DEST, ID_BROWSE, ID_EXTRACT, ID_PAUSE, ID_CANCEL, ID_PROGRESS, ID_STATS, ID_ERRORS, ID_DROP, ID_TIMER };
+enum { ID_ARCHIVE = 100, ID_OPEN, ID_DEST, ID_BROWSE, ID_EXTRACT, ID_PAUSE, ID_CANCEL, ID_PROGRESS, ID_STATS, ID_ERRORS, ID_DROP, ID_TIMER,
+       ID_THREADS_LBL, ID_THREADS, ID_TEST, ID_SHOW };
 
 using clock_t_ = std::chrono::steady_clock;
 
 struct App {
     HWND wnd{}, drop{}, archive{}, open{}, dest{}, browse{}, extract{}, pause{}, cancel{}, progress{}, stats{}, errors{};
+    HWND threads_lbl{}, threads{}, test{}, show{};
+    std::wstring run_name, run_dest;  // archive file name and destination of the current/last run
+    bool run_test = false;
+    clock_t_::time_point t1;          // set by the worker when extract() returns: exact end time
     HFONT font{}, big_font{};
     bool dark = false;
     HBRUSH bg{}, field{};
@@ -93,7 +98,15 @@ void update_buttons() {
     EnableWindow(app.extract, !run);
     EnableWindow(app.pause, run);
     EnableWindow(app.cancel, run);
+    EnableWindow(app.threads, !run);
+    EnableWindow(app.test, !run);
+    EnableWindow(app.show, !run && !app.run_test && GetFileAttributesW(app.run_dest.c_str()) != INVALID_FILE_ATTRIBUTES);
     SetWindowTextW(app.pause, run && app.prog->pause ? L"Resume" : L"Pause");
+}
+
+void log(const std::wstring& line) {
+    auto i = SendMessageW(app.errors, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    SendMessageW(app.errors, LB_SETTOPINDEX, i, 0);
 }
 
 std::wstring fmt_time(double s) {
@@ -107,8 +120,9 @@ void tick() {
     if (!app.prog) return;
     xx::Progress& p = *app.prog;
     auto now = clock_t_::now();
+    bool done = app.done.load();
     double dt = std::chrono::duration<double>(now - app.last_t).count();
-    double el = std::chrono::duration<double>(now - app.t0).count();
+    double el = std::chrono::duration<double>((done ? app.t1 : now) - app.t0).count();
     uint64_t bytes = p.bytes_done.load(), total = p.bytes_total.load(), cpu = process_cpu_100ns();
     double inst = (bytes - app.last_bytes) / 1048576.0 / std::max(dt, 1e-3);
     app.speed = app.speed == 0 ? inst : app.speed * 0.7 + inst * 0.3;
@@ -120,15 +134,14 @@ void tick() {
     GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
     SendMessageW(app.progress, PBM_SETPOS, total ? (WPARAM)(bytes * 1000 / total) : 0, 0);
 
-    bool done = app.done.load();
     wchar_t s[512];
     if (done) {
-        swprintf(s, 512, L"%ls  %llu files, %.1f MiB in %.2f s  •  average %.0f MiB/s  •  %u threads\n%zu errors",
-                 p.cancel ? L"Cancelled." : L"Done.", p.files_done.load(), bytes / 1048576.0, el, avg, p.threads.load(), p.error_count.load());
+        swprintf(s, 512, L"%ls  Time %.3f s\n%llu files, %.1f MiB  •  average %.0f MiB/s  •  %u threads\n%zu errors",
+                 p.cancel ? L"Cancelled." : L"Done.", el, p.files_done.load(), bytes / 1048576.0, avg, p.threads.load(), p.error_count.load());
     } else {
         double eta = avg > 0 ? (total - bytes) / 1048576.0 / avg : 0;
-        swprintf(s, 512, L"Speed %.0f MiB/s  (average %.0f)  •  ETA %ls%ls\nFiles %llu / %llu  •  %.1f / %.1f MiB\nCPU %.0f%%  •  RAM %llu MB  •  %u threads",
-                 p.pause ? 0.0 : app.speed, avg, fmt_time(eta).c_str(), p.pause ? L"  (paused)" : L"",
+        swprintf(s, 512, L"Time %.3f s  •  Speed %.0f MiB/s  (average %.0f)  •  ETA %ls%ls\nFiles %llu / %llu  •  %.1f / %.1f MiB\nCPU %.0f%%  •  RAM %llu MB  •  %u threads",
+                 el, p.pause ? 0.0 : app.speed, avg, fmt_time(eta).c_str(), p.pause ? L"  (paused)" : L"",
                  p.files_done.load(), p.files_total.load(), bytes / 1048576.0, total / 1048576.0, cpu_pct,
                  (unsigned long long)(pmc.WorkingSetSize >> 20), p.threads.load());
     }
@@ -137,9 +150,15 @@ void tick() {
 
     if (p.error_count.load() != app.errors_shown) {
         auto errs = p.errors();
-        for (; app.errors_shown < errs.size(); ++app.errors_shown) SendMessageW(app.errors, LB_ADDSTRING, 0, (LPARAM)errs[app.errors_shown].c_str());
+        for (; app.errors_shown < errs.size(); ++app.errors_shown) log(L"    ✗ " + errs[app.errors_shown]);
     }
     if (done) {
+        wchar_t r[512];
+        if (!app.fatal.empty()) swprintf(r, 512, L"✗ %ls  failed: %hs", app.run_name.c_str(), app.fatal.c_str());
+        else swprintf(r, 512, L"%ls %ls  %.3f s  •  %.0f MiB/s  •  %llu files, %.1f MiB  •  %u threads%ls  •  %zu errors",
+                      p.cancel ? L"■" : L"✓", app.run_name.c_str(), el, avg, p.files_done.load(), bytes / 1048576.0,
+                      p.threads.load(), app.run_test ? L"  •  test only" : L"", p.error_count.load());
+        log(r);
         KillTimer(app.wnd, ID_TIMER);
         app.worker = {};
         update_buttons();
@@ -150,19 +169,24 @@ void start() {
     std::wstring archive = get_text(app.archive), dest = get_text(app.dest);
     if (archive.empty()) { MessageBoxW(app.wnd, L"Choose or drop a ZIP archive first.", L"Extreme Extract", MB_ICONINFORMATION); return; }
     if (dest.empty()) dest = default_dest(archive);
-    SendMessageW(app.errors, LB_RESETCONTENT, 0, 0);
+    xx::Options opt;
+    opt.threads = (unsigned)std::max(0, _wtoi(get_text(app.threads).c_str()));
+    opt.test_only = SendMessageW(app.test, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    app.run_name = archive.substr(archive.find_last_of(L"\\/") + 1);
+    app.run_dest = dest, app.run_test = opt.test_only;
     app.errors_shown = 0;
     app.fatal.clear();
     app.done = false;
     app.prog = std::make_unique<xx::Progress>();
     app.t0 = app.last_t = clock_t_::now();
     app.last_bytes = 0, app.speed = 0, app.last_cpu = process_cpu_100ns();
-    app.worker = std::jthread([archive, dest, p = app.prog.get()] {
+    app.worker = std::jthread([archive, dest, opt, p = app.prog.get()] {
         try {
-            xx::extract(archive, dest, xx::Options{}, *p);
+            xx::extract(archive, dest, opt, *p);
         } catch (const std::exception& e) {
             app.fatal = e.what();
         }
+        app.t1 = clock_t_::now();
         app.done = true;
     });
     SetTimer(app.wnd, ID_TIMER, 100, nullptr);
@@ -187,8 +211,11 @@ void layout() {
     int y = m;
     put(app.drop, m, y, w, px(72)); y += px(72) + gap * 2;
     put(app.archive, m, y, w - bw - gap, h); put(app.open, m + w - bw, y, bw, h); y += h + gap;
-    put(app.dest, m, y, w - bw - gap, h); put(app.browse, m + w - bw, y, bw, h); y += h + gap * 2;
-    put(app.extract, m, y, bw, h); put(app.pause, m + bw + gap, y, bw, h); put(app.cancel, m + 2 * (bw + gap), y, bw, h); y += h + gap * 2;
+    put(app.dest, m, y, w - bw - gap, h); put(app.browse, m + w - bw, y, bw, h); y += h + gap;
+    put(app.threads_lbl, m, y + px(5), px(56), h); put(app.threads, m + px(56), y, px(56), h);
+    put(app.test, m + px(56 + 56) + gap * 2, y, w - px(112) - gap * 2, h); y += h + gap * 2;
+    put(app.extract, m, y, bw, h); put(app.pause, m + bw + gap, y, bw, h); put(app.cancel, m + 2 * (bw + gap), y, bw, h);
+    put(app.show, m + w - bw, y, bw, h); y += h + gap * 2;
     put(app.progress, m, y, w, px(14)); y += px(14) + gap * 2;
     put(app.stats, m, y, w, px(60)); y += px(60) + gap;
     put(app.errors, m, y, w, std::max<int>(rc.bottom - m - y, px(40)));
@@ -202,7 +229,8 @@ void apply_fonts() {
     app.font = CreateFontIndirectW(&ncm.lfMessageFont);
     ncm.lfMessageFont.lfHeight = ncm.lfMessageFont.lfHeight * 3 / 2;
     app.big_font = CreateFontIndirectW(&ncm.lfMessageFont);
-    for (HWND c : {app.archive, app.open, app.dest, app.browse, app.extract, app.pause, app.cancel, app.stats, app.errors})
+    for (HWND c : {app.archive, app.open, app.dest, app.browse, app.extract, app.pause, app.cancel, app.stats, app.errors,
+                   app.threads_lbl, app.threads, app.test, app.show})
         SendMessageW(c, WM_SETFONT, (WPARAM)app.font, TRUE);
     SendMessageW(app.drop, WM_SETFONT, (WPARAM)app.big_font, TRUE);
 }
@@ -223,14 +251,20 @@ void create_controls(HWND w) {
     app.progress = mk(PROGRESS_CLASSW, L"", 0, ID_PROGRESS);
     app.stats = mk(L"STATIC", L"Ready.", SS_LEFT, ID_STATS);
     app.errors = mk(L"LISTBOX", L"", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL, ID_ERRORS, WS_EX_CLIENTEDGE);
+    app.threads_lbl = mk(L"STATIC", L"Threads", SS_LEFT, ID_THREADS_LBL);
+    app.threads = mk(L"EDIT", L"", ES_NUMBER | WS_TABSTOP, ID_THREADS, WS_EX_CLIENTEDGE);
+    app.test = mk(L"BUTTON", L"Test only (decode + CRC check, no disk writes)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_TEST);
+    app.show = mk(L"BUTTON", L"Open folder", BS_PUSHBUTTON | WS_TABSTOP, ID_SHOW);
+    SendMessageW(app.threads, EM_SETCUEBANNER, TRUE, (LPARAM)L"auto");
     SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     SendMessageW(app.archive, EM_SETCUEBANNER, TRUE, (LPARAM)L"Archive");
     SendMessageW(app.dest, EM_SETCUEBANNER, TRUE, (LPARAM)L"Destination folder");
     SendMessageW(app.errors, LB_SETHORIZONTALEXTENT, 4000, 0);
     if (app.dark)
-        for (HWND c : {app.open, app.browse, app.extract, app.pause, app.cancel, app.errors}) SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+        for (HWND c : {app.open, app.browse, app.extract, app.pause, app.cancel, app.errors, app.show}) SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
     if (app.dark)
-        for (HWND c : {app.archive, app.dest}) SetWindowTheme(c, L"DarkMode_CFD", nullptr);
+        for (HWND c : {app.archive, app.dest, app.threads}) SetWindowTheme(c, L"DarkMode_CFD", nullptr);
+    if (app.dark) SetWindowTheme(app.test, L"", L"");  // themed checkboxes ignore WM_CTLCOLORSTATIC text color
     apply_fonts();
     layout();
     update_buttons();
@@ -249,7 +283,7 @@ LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_GETMINMAXINFO: {
             double s = GetDpiForWindow(w) / 96.0;
-            ((MINMAXINFO*)lp)->ptMinTrackSize = {(LONG)(480 * s), (LONG)(440 * s)};
+            ((MINMAXINFO*)lp)->ptMinTrackSize = {(LONG)(480 * s), (LONG)(480 * s)};
             return 0;
         }
         case WM_DROPFILES: {
@@ -267,6 +301,7 @@ LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_EXTRACT: start(); break;
                 case ID_PAUSE: if (running()) resume_or_cancel(false); break;
                 case ID_CANCEL: if (running()) resume_or_cancel(true); break;
+                case ID_SHOW: ShellExecuteW(w, L"open", app.run_dest.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
             }
             return 0;
         case WM_CTLCOLORSTATIC:
@@ -315,7 +350,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show) {
 
     const double s = GetDpiForSystem() / 96.0;
     HWND w = CreateWindowExW(0, wc.lpszClassName, L"Extreme Extract", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             (int)(640 * s), (int)(560 * s), nullptr, nullptr, hi, nullptr);
+                             (int)(720 * s), (int)(620 * s), nullptr, nullptr, hi, nullptr);
     BOOL dark = app.dark;
     DwmSetWindowAttribute(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
 

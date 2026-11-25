@@ -116,7 +116,7 @@ void create_dir_chain(const std::wstring& root) {
 }
 
 bool write_all(HANDLE h, const uint8_t* p, uint64_t n, std::string& err) {
-    while (n) {
+    while (h && n) {
         DWORD w;
         if (!WriteFile(h, p, (DWORD)std::min<uint64_t>(n, 1u << 30), &w, nullptr)) { err = win_error(); return false; }
         p += w;
@@ -151,11 +151,14 @@ public:
         if (!e.error.empty()) return fail(e, e.error);
         if (!resolve_data(j_.mf.data, j_.mf.size, e, err)) return fail(e, err);
 
-        const std::wstring path = j_.root + e.path;
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return fail(e, win_error());
+        HANDLE h = nullptr;  // stays null in test mode: decode and check only
+        if (!j_.opt.test_only) {
+            h = CreateFileW((j_.root + e.path).c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return fail(e, win_error());
+        }
 
         bool ok = write_entry(h, e, err);
+        if (!h) return ok ? (void)j_.p.files_done.fetch_add(1, std::memory_order_relaxed) : fail(e, err);
         if (ok) {
             set_times(h, e.mtime, e.attrs);
             j_.closer.push(h);
@@ -185,7 +188,7 @@ private:
     }
 
     bool write_entry(HANDLE h, const Entry& e, std::string& err) {
-        if (e.size >= j_.opt.prealloc_min) {
+        if (h && e.size >= j_.opt.prealloc_min) {
             FILE_END_OF_FILE_INFO eof{};
             eof.EndOfFile.QuadPart = (LONGLONG)e.size;
             SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof);
@@ -213,7 +216,7 @@ private:
                 if (err != "retry") return false;
                 // Stream has a block too big for the parallel decoder: start over sequentially.
                 LARGE_INTEGER zero{};
-                if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) { err = win_error(); return false; }
+                if (h && !SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) { err = win_error(); return false; }
                 j_.p.bytes_done.fetch_sub(emitted, std::memory_order_relaxed);
                 crc = 0, emitted = 0;
                 err.clear();
@@ -251,8 +254,8 @@ size_t extract(const std::wstring& archive, const std::wstring& dest, const Opti
 
     MappedFile mf(archive);
     std::vector<Entry> entries = parse_central_directory(mf.data, mf.size);
-    const std::wstring root = make_root(dest);
-    create_dir_chain(root);
+    const std::wstring root = opt.test_only ? L"" : make_root(dest);
+    if (!opt.test_only) create_dir_chain(root);
 
     // Plan: last entry wins for duplicate names (Windows names are case-insensitive).
     std::unordered_map<std::wstring, uint32_t> by_name;
@@ -275,12 +278,14 @@ size_t extract(const std::wstring& archive, const std::wstring& dest, const Opti
     }
     std::vector<std::wstring> dir_list(dirs.begin(), dirs.end());
     std::sort(dir_list.begin(), dir_list.end());  // parents sort before children
-    for (auto& d : dir_list) CreateDirectoryW((root + d).c_str(), nullptr);
+    if (!opt.test_only)
+        for (auto& d : dir_list) CreateDirectoryW((root + d).c_str(), nullptr);
 
     // Longest-processing-time-first: big entries start early so they don't finish last alone.
     std::sort(files.begin(), files.end(), [&](uint32_t a, uint32_t b) { return entries[a].size > entries[b].size; });
     uint64_t total = 0;
-    for (uint32_t i : files) total += entries[i].size;
+    unsigned big = 0;  // entries that will use parallel decompression
+    for (uint32_t i : files) total += entries[i].size, big += entries[i].method == 8 && entries[i].size > opt.one_shot_limit && entries[i].size >= opt.pinflate_min;
     p.files_total = files.size();
     p.bytes_total = total;
 
@@ -294,7 +299,9 @@ size_t extract(const std::wstring& archive, const std::wstring& dest, const Opti
     {
         Closer closer(opt.closers ? opt.closers : n);
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        Job job{mf, root, opt, p, closer, std::max(1u, (opt.threads ? opt.threads : hw) / n)};
+        // Big entries get the whole machine split between them, even while other workers are busy
+        // with small files: otherwise one huge entry decodes alone on one core at the end.
+        Job job{mf, root, opt, p, closer, std::max(1u, (opt.threads ? opt.threads : hw) / std::max(1u, std::min(n, big)))};
         std::atomic<size_t> next{0};
         auto run = [&] {
             no_power_throttling();
@@ -307,7 +314,7 @@ size_t extract(const std::wstring& archive, const std::wstring& dest, const Opti
         run();
     }  // joins workers, then drains the closer queue
 
-    for (uint32_t i : dirs_with_time) {  // after files, since creating files touches dir mtimes
+    for (uint32_t i : opt.test_only ? std::vector<uint32_t>{} : dirs_with_time) {  // after files, since creating files touches dir mtimes
         HANDLE h = CreateFileW((root + entries[i].path).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (h == INVALID_HANDLE_VALUE) continue;

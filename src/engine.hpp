@@ -17,6 +17,7 @@ struct Options {
     uint64_t pinflate_min = 128ull << 20;   // Deflate entries this big are decompressed on several threads
     size_t pinflate_chunk = 4 << 20;        // compressed bytes per parallel-decompression chunk
     bool stop_on_error = false;
+    bool test_only = false;                 // decode and verify CRCs, write nothing
 };
 
 struct Progress {

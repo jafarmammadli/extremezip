@@ -16,7 +16,7 @@ static std::string utf8(const std::wstring& w) {
 }
 
 static int usage() {
-    std::fputs("usage: xx <archive.zip> [-o dest] [-t threads] [-c closers] [--one-shot-mb N] [--pinflate-min-mb N] [--pinflate-chunk-kb N] [--stop-on-error] [-q]\n", stderr);
+    std::fputs("usage: xx <archive.zip> [-o dest] [-t threads] [-c closers] [--one-shot-mb N] [--pinflate-min-mb N] [--pinflate-chunk-kb N] [--stop-on-error] [--test] [-q]\n", stderr);
     return 2;
 }
 
@@ -35,6 +35,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--pinflate-min-mb" && more) opt.pinflate_min = (uint64_t)_wtoi64(argv[++i]) << 20;
         else if (a == L"--pinflate-chunk-kb" && more) opt.pinflate_chunk = (size_t)_wtoi64(argv[++i]) << 10;
         else if (a == L"--stop-on-error") opt.stop_on_error = true;
+        else if (a == L"--test") opt.test_only = true;
         else if (a == L"-q") quiet = true;
         else if (a[0] != L'-' && archive.empty()) archive = a;
         else return usage();
